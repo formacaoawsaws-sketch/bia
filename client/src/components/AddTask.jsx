@@ -17,7 +17,7 @@ const AddTask = ({ onAdd }) => {
 
     onAdd({ 
       titulo: titulo.trim(), 
-      dia_atividade: dia || new Date().toLocaleDateString('pt-BR'), 
+      dia_atividade: dia || new Date().toISOString().split('T')[0], 
       importante 
     });
 
@@ -59,7 +59,7 @@ const AddTask = ({ onAdd }) => {
       </div>
       
       <button type="submit" className="btn btn-block success">
-        Add New Task
+        Adicione uma nova tarefa com IA
       </button>
       
       <Modal
