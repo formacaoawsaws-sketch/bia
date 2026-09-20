@@ -9,7 +9,7 @@
         "--access-mode=unrestricted"
       ],
       "env": {
-        "DATABASE_URI": "postgresql://postgres:postgres@localhost:5433/bia"
+        "DATABASE_URI": "postgresql://postgres:bYdMdoWPbnVexXmEKm9Z@bia.cyhwc2c28vmy.us-east-1.rds.amazonaws.com:5432/bia"
       }
     }
   }

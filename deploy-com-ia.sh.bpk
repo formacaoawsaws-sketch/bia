@@ -1,0 +1,497 @@
+#!/bin/bash
+
+# =============================================================================
+# BIA - Script de Deploy e Rollback para ECS
+# =============================================================================
+# Uso: ./deploy-com-ia.sh
+# Pré-requisitos:
+#   - AWS CLI configurado (role da instância EC2)
+#   - Docker instalado e em execução
+#   - Repositório Git com commits
+# =============================================================================
+
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Configurações fixas
+# ---------------------------------------------------------------------------
+REGION="us-east-1"
+ECR_REPO_NAME="bia"
+CONTAINER_NAME="bia"
+DEPLOY_TIMEOUT=30  # segundos para aguardar estabilização
+
+# Cores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ---------------------------------------------------------------------------
+# Funções utilitárias
+# ---------------------------------------------------------------------------
+
+log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[OK]${NC}   $1"; }
+log_warn()    { echo -e "${YELLOW}[AVISO]${NC} $1"; }
+log_error()   { echo -e "${RED}[ERRO]${NC} $1" >&2; }
+log_step()    { echo -e "\n${BOLD}${CYAN}==> $1${NC}"; }
+
+separator() {
+  echo -e "${CYAN}$(printf '─%.0s' {1..60})${NC}"
+}
+
+# ---------------------------------------------------------------------------
+# Selecionar ambiente
+# ---------------------------------------------------------------------------
+selecionar_ambiente() {
+  echo ""
+  separator
+  echo -e "${BOLD}  Selecione o ambiente:${NC}"
+  separator
+  echo "  1) Sem ALB  →  Cluster-bia2       /  service-bia2       /  task-def-bia"
+  echo "  2) Com ALB  →  cluster-bia-alb   /  service-bia-alb   /  task-def-bia-alb"
+  separator
+  echo ""
+  printf "  Digite sua opção [1 ou 2]: "
+  read -r opcao_ambiente < /dev/tty
+
+  case "$opcao_ambiente" in
+    1)
+      CLUSTER="Cluster-bia2"
+      SERVICE="service-bia2"
+      TASK_DEF_FAMILY="task-def-bia"
+      AMBIENTE_LABEL="Sem ALB"
+      ;;
+    2)
+      CLUSTER="cluster-bia-alb"
+      SERVICE="service-bia-alb"
+      TASK_DEF_FAMILY="task-def-bia-alb"
+      AMBIENTE_LABEL="Com ALB"
+      ;;
+    *)
+      log_error "Opção inválida: '$opcao_ambiente'. Execute o script novamente."
+      exit 1
+      ;;
+  esac
+
+  log_success "Ambiente selecionado: ${BOLD}$AMBIENTE_LABEL${NC}"
+  log_info "  Cluster:         $CLUSTER"
+  log_info "  Service:         $SERVICE"
+  log_info "  Task Definition: $TASK_DEF_FAMILY"
+}
+
+# ---------------------------------------------------------------------------
+# Buscar URI do ECR
+# ---------------------------------------------------------------------------
+buscar_ecr_uri() {
+  log_step "Buscando URI do repositório ECR..."
+
+  ECR_REGISTRY=$(aws ecr describe-repositories \
+    --repository-names "$ECR_REPO_NAME" \
+    --region "$REGION" \
+    --query 'repositories[0].repositoryUri' \
+    --output text 2>/dev/null || true)
+
+  if [[ -z "$ECR_REGISTRY" || "$ECR_REGISTRY" == "None" ]]; then
+    log_error "Repositório ECR '$ECR_REPO_NAME' não encontrado na região $REGION."
+    exit 1
+  fi
+
+  log_success "ECR URI: $ECR_REGISTRY"
+}
+
+# ---------------------------------------------------------------------------
+# Login no ECR
+# ---------------------------------------------------------------------------
+login_ecr() {
+  log_step "Autenticando no ECR..."
+
+  ECR_REGISTRY_BASE=$(echo "$ECR_REGISTRY" | cut -d'/' -f1)
+
+  aws ecr get-login-password --region "$REGION" \
+    | docker login --username AWS --password-stdin "$ECR_REGISTRY_BASE"
+
+  log_success "Login no ECR realizado com sucesso."
+}
+
+# ---------------------------------------------------------------------------
+# Obter VITE_API_URL atual da imagem Docker no ECR
+# ---------------------------------------------------------------------------
+obter_vite_api_url() {
+  log_step "Buscando VITE_API_URL da imagem atual no ECR..."
+
+  VITE_API_URL=$(docker inspect "${ECR_REGISTRY}:latest" \
+    --format '{{json .Config.Env}}' 2>/dev/null \
+    | jq -r '.[] | select(startswith("VITE_API_URL="))' \
+    | cut -d'=' -f2- || true)
+
+  if [[ -z "$VITE_API_URL" ]]; then
+    echo ""
+    log_warn "VITE_API_URL não encontrado na imagem ECR local."
+    printf "  Informe o VITE_API_URL para o build (ex: http://1.2.3.4): "
+    read -r VITE_API_URL < /dev/tty
+    if [[ -z "$VITE_API_URL" ]]; then
+      log_error "VITE_API_URL é obrigatório para o build do frontend."
+      exit 1
+    fi
+  else
+    log_success "VITE_API_URL encontrado: $VITE_API_URL"
+    printf "  Deseja usar este valor? [S/n]: "
+    read -r confirmar_url < /dev/tty
+    if [[ "${confirmar_url,,}" == "n" ]]; then
+      printf "  Informe o novo VITE_API_URL: "
+      read -r VITE_API_URL < /dev/tty
+      if [[ -z "$VITE_API_URL" ]]; then
+        log_error "VITE_API_URL não pode ser vazio."
+        exit 1
+      fi
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Build da imagem Docker
+# ---------------------------------------------------------------------------
+build_imagem() {
+  log_step "Construindo imagem Docker..."
+
+  PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  log_info "Raiz do projeto: $PROJECT_ROOT"
+  log_info "Tag da imagem:   $IMAGE_TAG"
+  log_info "VITE_API_URL:    $VITE_API_URL"
+
+  docker build \
+    --no-cache \
+    --build-arg VITE_API_URL="$VITE_API_URL" \
+    -t "$ECR_REGISTRY:$IMAGE_TAG" \
+    -t "$ECR_REGISTRY:latest" \
+    -f "$PROJECT_ROOT/Dockerfile" \
+    "$PROJECT_ROOT"
+
+  log_success "Imagem construída com sucesso: $ECR_REGISTRY:$IMAGE_TAG"
+}
+
+# ---------------------------------------------------------------------------
+# Push da imagem para o ECR
+# ---------------------------------------------------------------------------
+push_imagem() {
+  log_step "Fazendo push da imagem para o ECR..."
+
+  docker push "$ECR_REGISTRY:$IMAGE_TAG"
+  docker push "$ECR_REGISTRY:latest"
+
+  log_success "Push concluído: $ECR_REGISTRY:$IMAGE_TAG"
+}
+
+# ---------------------------------------------------------------------------
+# Registrar nova revisão da Task Definition
+# ---------------------------------------------------------------------------
+registrar_task_definition() {
+  log_step "Registrando nova revisão da Task Definition..."
+
+  TASK_DEF_JSON=$(aws ecs describe-task-definition \
+    --task-definition "$TASK_DEF_FAMILY" \
+    --region "$REGION" \
+    --query 'taskDefinition' \
+    --output json)
+
+  NEW_TASK_DEF_JSON=$(echo "$TASK_DEF_JSON" | \
+    jq --arg IMAGE "$ECR_REGISTRY:$IMAGE_TAG" \
+    --arg CONTAINER "$CONTAINER_NAME" \
+    '
+    .containerDefinitions |= map(
+      if .name == $CONTAINER then .image = $IMAGE else . end
+    ) |
+    del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+        .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+    ')
+
+  NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+    --region "$REGION" \
+    --cli-input-json "$NEW_TASK_DEF_JSON" \
+    --query 'taskDefinition.taskDefinitionArn' \
+    --output text)
+
+  NEW_REVISION=$(echo "$NEW_TASK_DEF_ARN" | awk -F':' '{print $NF}')
+
+  log_success "Nova revisão registrada: ${TASK_DEF_FAMILY}:${NEW_REVISION}"
+  log_info "ARN: $NEW_TASK_DEF_ARN"
+}
+
+# ---------------------------------------------------------------------------
+# Atualizar o ECS Service
+# ---------------------------------------------------------------------------
+atualizar_service() {
+  local task_def_arn="$1"
+  local revisao_label="$2"
+
+  log_step "Atualizando ECS Service para $revisao_label..."
+
+  aws ecs update-service \
+    --cluster "$CLUSTER" \
+    --service "$SERVICE" \
+    --task-definition "$task_def_arn" \
+    --region "$REGION" \
+    --query 'service.{status:status,desiredCount:desiredCount,runningCount:runningCount,taskDefinition:taskDefinition}' \
+    --output table
+
+  log_success "Service atualizado com sucesso."
+}
+
+# ---------------------------------------------------------------------------
+# Aguardar estabilização do service
+# ---------------------------------------------------------------------------
+aguardar_estabilizacao() {
+  log_step "Aguardando estabilização do service (timeout: ${DEPLOY_TIMEOUT}s)..."
+  log_info "Cluster: $CLUSTER | Service: $SERVICE"
+  echo ""
+
+  local start_time
+  start_time=$(date +%s)
+
+  if aws ecs wait services-stable \
+    --cluster "$CLUSTER" \
+    --services "$SERVICE" \
+    --region "$REGION" \
+    2>/dev/null; then
+
+    local elapsed=$(( $(date +%s) - start_time ))
+    log_success "Service estabilizado com sucesso em ${elapsed}s! ✅"
+  else
+    local elapsed=$(( $(date +%s) - start_time ))
+    log_error "Timeout ou falha na estabilização após ${elapsed}s."
+    log_warn "Verifique os eventos do service:"
+    log_warn "  aws ecs describe-services --cluster $CLUSTER --services $SERVICE --region $REGION"
+    exit 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Fluxo de DEPLOY
+# ---------------------------------------------------------------------------
+fluxo_deploy() {
+  selecionar_ambiente
+  buscar_ecr_uri
+
+  IMAGE_TAG=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --short HEAD 2>/dev/null || true)
+
+  if [[ -z "$IMAGE_TAG" ]]; then
+    log_error "Não foi possível obter o hash do commit Git."
+    exit 1
+  fi
+
+  log_success "Commit hash: $IMAGE_TAG"
+
+  echo ""
+  separator
+  echo -e "${BOLD}  Resumo do Deploy${NC}"
+  separator
+  echo "  Ambiente:        $AMBIENTE_LABEL"
+  echo "  Cluster:         $CLUSTER"
+  echo "  Service:         $SERVICE"
+  echo "  Task Definition: $TASK_DEF_FAMILY"
+  echo "  Imagem:          $ECR_REPO_NAME:$IMAGE_TAG"
+  separator
+  echo ""
+  printf "  Confirmar deploy? [s/N]: "
+  read -r confirmar < /dev/tty
+
+  if [[ "${confirmar,,}" != "s" ]]; then
+    log_warn "Deploy cancelado pelo usuário."
+    exit 0
+  fi
+
+  obter_vite_api_url
+  login_ecr
+  build_imagem
+  push_imagem
+  registrar_task_definition
+  atualizar_service "$NEW_TASK_DEF_ARN" "${TASK_DEF_FAMILY}:${NEW_REVISION}"
+  aguardar_estabilizacao
+
+  echo ""
+  separator
+  echo -e "${GREEN}${BOLD}  ✅ Deploy concluído com sucesso!${NC}"
+  echo "  Ambiente:   $AMBIENTE_LABEL"
+  echo "  Revisão:    ${TASK_DEF_FAMILY}:${NEW_REVISION}"
+  echo "  Imagem:     $ECR_REGISTRY:$IMAGE_TAG"
+  separator
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Fluxo de ROLLBACK
+# ---------------------------------------------------------------------------
+fluxo_rollback() {
+  selecionar_ambiente
+
+  log_step "Listando revisões ativas da Task Definition: $TASK_DEF_FAMILY"
+  echo ""
+
+  # Busca ARNs das revisões ativas
+  mapfile -t REVISOES_ARNS < <(aws ecs list-task-definitions \
+    --family-prefix "$TASK_DEF_FAMILY" \
+    --status ACTIVE \
+    --sort DESC \
+    --region "$REGION" \
+    --query 'taskDefinitionArns[]' \
+    --output text | tr '\t' '\n')
+
+  TOTAL=${#REVISOES_ARNS[@]}
+
+  if [[ "$TOTAL" -eq 0 ]]; then
+    log_error "Nenhuma revisão ativa encontrada para '$TASK_DEF_FAMILY'."
+    exit 1
+  fi
+
+  # Revisão atualmente em uso no service
+  CURRENT_ARN=$(aws ecs describe-services \
+    --cluster "$CLUSTER" \
+    --services "$SERVICE" \
+    --region "$REGION" \
+    --query 'services[0].taskDefinition' \
+    --output text 2>/dev/null || true)
+
+  CURRENT_REVISION=$(echo "$CURRENT_ARN" | awk -F':' '{print $NF}')
+
+  # Cabeçalho
+  printf "\n"
+  printf "${BOLD}%-12s %-12s %-50s %-20s${NC}\n" "Revisão" "Status" "Imagem" "Registrada em"
+  separator
+
+  MAX_EXIBIR=15
+  COUNT=0
+
+  for ARN in "${REVISOES_ARNS[@]}"; do
+    [[ $COUNT -ge $MAX_EXIBIR ]] && break
+
+    REVISION_NUM=$(echo "$ARN" | awk -F':' '{print $NF}')
+
+    TD_JSON=$(aws ecs describe-task-definition \
+      --task-definition "$ARN" \
+      --region "$REGION" \
+      --query 'taskDefinition.{image:containerDefinitions[0].image,registeredAt:registeredAt}' \
+      --output json 2>/dev/null || echo '{}')
+
+    IMG=$(echo "$TD_JSON" | jq -r '.image // "N/A"')
+    REG=$(echo "$TD_JSON" | jq -r '.registeredAt // "N/A"' | cut -c1-19 | tr 'T' ' ')
+
+    if [[ "$REVISION_NUM" == "$CURRENT_REVISION" ]]; then
+      STATUS_LABEL="${GREEN}● EM USO${NC}"
+    else
+      STATUS_LABEL="  ativa "
+    fi
+
+    printf "${BOLD}%-12s${NC} %-20b %-50s %-20s\n" \
+      "$REVISION_NUM" "$STATUS_LABEL" "$IMG" "$REG"
+
+    COUNT=$(( COUNT + 1 ))
+  done
+
+  echo ""
+  [[ $TOTAL -gt $MAX_EXIBIR ]] && log_warn "Exibindo as últimas $MAX_EXIBIR de $TOTAL revisões."
+
+  # Pergunta qual revisão usar
+  separator
+  printf "  Digite o número da revisão para rollback: "
+  read -r REVISAO_ESCOLHIDA < /dev/tty
+
+  if ! [[ "$REVISAO_ESCOLHIDA" =~ ^[0-9]+$ ]]; then
+    log_error "Revisão inválida: '$REVISAO_ESCOLHIDA'. Informe apenas o número."
+    exit 1
+  fi
+
+  ROLLBACK_ARN="${TASK_DEF_FAMILY}:${REVISAO_ESCOLHIDA}"
+
+  # Verifica se a revisão existe
+  VERIFY=$(aws ecs describe-task-definition \
+    --task-definition "$ROLLBACK_ARN" \
+    --region "$REGION" \
+    --query 'taskDefinition.taskDefinitionArn' \
+    --output text 2>/dev/null || true)
+
+  if [[ -z "$VERIFY" || "$VERIFY" == "None" ]]; then
+    log_error "Revisão '$ROLLBACK_ARN' não encontrada ou inativa."
+    exit 1
+  fi
+
+  echo ""
+  separator
+  echo -e "${BOLD}  Resumo do Rollback${NC}"
+  separator
+  echo "  Ambiente:   $AMBIENTE_LABEL"
+  echo "  Cluster:    $CLUSTER"
+  echo "  Service:    $SERVICE"
+  echo "  Revisão:    $ROLLBACK_ARN"
+  separator
+  echo ""
+  printf "  Confirmar rollback para revisão $REVISAO_ESCOLHIDA? [s/N]: "
+  read -r confirmar < /dev/tty
+
+  if [[ "${confirmar,,}" != "s" ]]; then
+    log_warn "Rollback cancelado pelo usuário."
+    exit 0
+  fi
+
+  atualizar_service "$ROLLBACK_ARN" "$ROLLBACK_ARN"
+  aguardar_estabilizacao
+
+  echo ""
+  separator
+  echo -e "${GREEN}${BOLD}  ✅ Rollback concluído com sucesso!${NC}"
+  echo "  Ambiente:   $AMBIENTE_LABEL"
+  echo "  Revisão:    $ROLLBACK_ARN"
+  separator
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Menu principal
+# ---------------------------------------------------------------------------
+menu_principal() {
+  clear
+  echo ""
+  separator
+  echo -e "${BOLD}${CYAN}  BIA — Deploy & Rollback para ECS${NC}"
+  separator
+  echo "  1) Deploy    → Build + Push ECR + Nova revisão + Atualiza service"
+  echo "  2) Rollback  → Lista revisões + Reverte service para revisão escolhida"
+  echo "  0) Sair"
+  separator
+  echo ""
+  printf "  Selecione uma opção: "
+  read -r opcao_menu < /dev/tty
+
+  case "$opcao_menu" in
+    1) fluxo_deploy ;;
+    2) fluxo_rollback ;;
+    0) echo ""; log_info "Saindo..."; exit 0 ;;
+    *)
+      log_error "Opção inválida: '$opcao_menu'."
+      exit 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Verificações iniciais
+# ---------------------------------------------------------------------------
+verificar_dependencias() {
+  local deps=("aws" "docker" "git" "jq")
+  for dep in "${deps[@]}"; do
+    if ! command -v "$dep" &>/dev/null; then
+      log_error "Dependência não encontrada: $dep"
+      exit 1
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Ponto de entrada
+# ---------------------------------------------------------------------------
+verificar_dependencias
+menu_principal
