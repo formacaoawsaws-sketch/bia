@@ -59,7 +59,7 @@ const AddTask = ({ onAdd }) => {
       </div>
       
       <button type="submit" className="btn btn-block success">
-        Adicione tarefa com CI/CD
+        Adicione tarefa com cache
       </button>
       
       <Modal
